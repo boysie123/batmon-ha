@@ -63,6 +63,7 @@ options:
   bt_power_cycle: false
   bt_power_cycle_on_error: false
   ble_stack: bleak
+  reconnect_interval_minutes: 240
   # sample_period/publish_period/expire_values_after are kept here (and required
   # in the schema) so they render as normal, always-visible fields. They must NOT
   # live in the collapsed "unused optional configuration options" section: edits
@@ -116,6 +117,8 @@ schema:
   # Drop each keep_alive BLE link every N minutes (+/-20% jitter) so the next
   # connect re-picks the backend/proxy. Only useful with several esphome
   # proxies; each reconnect costs a few seconds of data. 0/unset = off.
+  # Defaults to 240 (4h) here specifically because this deployment runs 3
+  # esphome proxies - a single-proxy/bleak install should set this back to 0.
   reconnect_interval_minutes: "float?"
 
   # "bleak" = stock BlueZ/D-Bus stack (default); "bumble" = bumble-bleak
