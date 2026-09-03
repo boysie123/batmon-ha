@@ -24,6 +24,11 @@ from bmslib.util import get_logger, summarize_exc
 
 logger = get_logger(verbose=False)
 
+# only safe for a fetch_loop instance that drives a single device on its own -
+# see fetch_loop()'s own docstring for why the shared serial loop must keep the
+# lower default instead.
+FETCH_ERROR_BACKOFF_CAP = 600
+
 
 class SampleExpiredError(Exception):
     pass
@@ -394,8 +399,17 @@ class BmsSampler:
             # the stale-notify-FD failure mode connect()'s own cleanup exists to
             # prevent (#384) - this caller just wasn't going through connect()'s
             # cleanup path at all. reset=True runs that same cleanup explicitly.
+            # Takes ConnectLock first: the reset path (_force_disconnect() on
+            # BtBms, and the equivalent block in BLE_BMS_wrap.BMS.disconnect())
+            # is documented as running under this lock - connect() itself always
+            # holds it (see BtBms.__aenter__/BLE_BMS_wrap.BMS.__aenter__) - but this
+            # caller sits outside connect()'s own flow entirely, so without taking
+            # the lock explicitly here it'd run concurrently with another device's
+            # connect/disconnect on the same shared BLE stack (found in upstream
+            # review of PR #406, never actually hit live here but real).
             try:
-                await bms.disconnect(reset=True)
+                async with bmslib.bt.ConnectLock:
+                    await bms.disconnect(reset=True)
             except Exception as e:
                 logger.warning('%s periodic reconnect: disconnect failed: %s', bms.name, e)
 
@@ -717,7 +731,7 @@ class Downsampler:
         return s
 
 
-async def fetch_loop(fn, period, max_errors, should_stop=None):
+async def fetch_loop(fn, period, max_errors, should_stop=None, max_backoff=60):
     """Drive `fn` every `period` seconds, aborting after `max_errors` consecutive failures.
 
     `num_errors_row` counts *consecutive* failing cycles: it drives the 1.1**n
@@ -727,6 +741,18 @@ async def fetch_loop(fn, period, max_errors, should_stop=None):
     count grew for the lifetime of the add-on: every error slept the full 60 s
     cap after ~44 lifetime errors, and the watchdog aborted a perfectly healthy
     add-on once it reached 200 (#391).
+
+    `max_backoff` default (60s) is only safe to raise where a slow cycle only
+    delays the ONE device that's actually failing - true for the per-device
+    fetch_loop instances main.py's concurrent/parallel_fetch branch creates
+    (one call per BMS), NOT for the single shared instance the serial branch
+    uses to drive all devices through one combined `fn()`: there, any single
+    device's exception makes the whole batch's `fn()` raise, so a chronically
+    failing device would push the sample interval for every OTHER, healthy
+    device out to `max_backoff` too, not just its own (found in upstream
+    review of PR #405 - this is why that PR's flat 60->600 change was
+    rejected). Callers driving a per-device loop may pass a higher value;
+    the shared serial loop must keep the default.
     """
     num_errors_row = 0
     while not (should_stop and should_stop()):
@@ -753,5 +779,9 @@ async def fetch_loop(fn, period, max_errors, should_stop=None):
             if max_errors and num_errors_row > max_errors:
                 logger.warning('too many errors, abort')
                 break
-            await asyncio.sleep(min(1.1 ** num_errors_row, 60))
+            # exponent clamped to 100 (1.1**100 ~ 13780, already far past any
+            # sane max_backoff) - unclamped, 1.1**n overflows OverflowError
+            # around n=7448 and kills the loop instead of just capping the
+            # sleep (found in upstream review of PR #405).
+            await asyncio.sleep(min(1.1 ** min(num_errors_row, 100), max_backoff))
         await asyncio.sleep(period)

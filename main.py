@@ -43,7 +43,7 @@ from bmslib.bms import MIN_VALUE_EXPIRY
 from bmslib.group import BmsGroup, VirtualGroupBms, resolve_member_ref
 from bmslib.models import construct_bms, is_serial_device
 from bmslib.mqtt_util import mqtt_last_publish_time, mqtt_message_handler, mqtt_process_action_queue
-from bmslib.sampling import BmsSampler, fetch_loop as _fetch_loop
+from bmslib.sampling import BmsSampler, fetch_loop as _fetch_loop, FETCH_ERROR_BACKOFF_CAP
 from bmslib.scan import stop_all_scanners
 from bmslib.store import load_user_config
 from bmslib.util import get_logger, exit_process
@@ -56,9 +56,10 @@ shutdown = False
 t_last_store = 0
 
 
-async def fetch_loop(fn, period, max_errors):
+async def fetch_loop(fn, period, max_errors, max_backoff=60):
     # the loop itself lives in bmslib.sampling so it is testable (main.py runs asyncio.run at import)
-    await _fetch_loop(fn, period=period, max_errors=max_errors, should_stop=lambda: shutdown)
+    await _fetch_loop(fn, period=period, max_errors=max_errors, should_stop=lambda: shutdown,
+                       max_backoff=max_backoff)
 
     logger.debug("fetch_loop %s ends", fn)
     if isinstance(fn, BmsSampler):
@@ -382,11 +383,14 @@ async def main():
         sys.exit(0)
 
     if parallel_fetch:
-        # parallel_fetch now uses a loop for each BMS, so they don't delay each other
+        # parallel_fetch now uses a loop for each BMS, so they don't delay each other -
+        # safe to use the higher max_backoff here (unlike the shared serial fn() below)
+        # since a slow cycle on one device's own loop only delays that one device.
 
         # this outer while loop recovers from a cancelled task. this happens when a device disconnects (bleak bug?)
         while not shutdown:
-            loops = [asyncio.create_task(fetch_loop(fn, period=sample_period, max_errors=max_errors)) for fn in tasks]
+            loops = [asyncio.create_task(fetch_loop(fn, period=sample_period, max_errors=max_errors,
+                                                      max_backoff=FETCH_ERROR_BACKOFF_CAP)) for fn in tasks]
             done, pending = await asyncio.wait(loops, return_when='FIRST_COMPLETED')
 
             logger.debug('Done= %s, Pending=%s', done, pending)
