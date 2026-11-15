@@ -1,5 +1,8 @@
 import asyncio
-import fcntl
+try:
+    import fcntl  # Linux-only (BlueZ HCI ioctl helper below) - absent on Windows
+except ImportError:
+    fcntl = None
 import logging
 import math
 import os
